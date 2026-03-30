@@ -13,7 +13,7 @@ import {
   type DivisionSummary,
 } from "./shared.js";
 
-import { parliamentFetch, BILLS_API, batchedFetch } from "../api/client.js";
+import { parliamentFetch, BILLS_API, COMMONS_VOTES_API, MEMBERS_API, batchedFetch } from "../api/client.js";
 
 // ─── Tool Definition ──────────────────────────────────────────────────────────
 
@@ -21,13 +21,17 @@ export const eventsTools = [
   {
     name: "get_events",
     description:
-      "Get recent parliamentary events: votes/divisions, party rebellions, or bill stage changes. event_type='division' returns recent votes with results. event_type='rebellion' returns divisions that had party rebels, optionally filtered by party. event_type='bill' returns bills filtered by stage or keyword. Returns events sorted by date.",
+      "Get recent parliamentary events: votes/divisions, party rebellions, bill stage changes, or a specific MP's voting record. " +
+      "event_type='division': recent votes with pass/fail results. " +
+      "event_type='rebellion': divisions with party rebels, optionally filtered by party. " +
+      "event_type='bill': bills filtered by stage or keyword. " +
+      "event_type='member_votes': full voting history for a specific MP — pass name='Nigel Farage' (or mp_id if already known). Shows each division, how the MP voted (Aye/No), and the result.",
     inputSchema: {
       type: "object",
       properties: {
         event_type: {
           type: "string",
-          enum: ["division", "rebellion", "bill"],
+          enum: ["division", "rebellion", "bill", "member_votes"],
           description: "The type of event to retrieve.",
         },
         house: {
@@ -37,8 +41,15 @@ export const eventsTools = [
         },
         party: {
           type: "string",
-          description:
-            "For event_type='rebellion', filter to this party's rebels.",
+          description: "For event_type='rebellion', filter to this party's rebels.",
+        },
+        name: {
+          type: "string",
+          description: "For event_type='member_votes': the MP's name (e.g. 'Nigel Farage').",
+        },
+        mp_id: {
+          type: "number",
+          description: "For event_type='member_votes': the MP's member ID if already known.",
         },
         days: {
           type: "number",
@@ -50,13 +61,11 @@ export const eventsTools = [
         },
         stage: {
           type: "string",
-          description:
-            "For event_type='bill': firstreading, secondreading, committee, report, thirdreading, royalassent.",
+          description: "For event_type='bill': firstreading, secondreading, committee, report, thirdreading, royalassent.",
         },
         keyword: {
           type: "string",
-          description:
-            "For event_type='bill', search bill titles by keyword.",
+          description: "For event_type='bill', search bill titles by keyword.",
         },
       },
       required: ["event_type"],
@@ -134,9 +143,13 @@ export async function handleEventsTool(
       const stage = args.stage as string | undefined;
       const keyword = args.keyword as string | undefined;
       return await handleBillEvents(house, limit, stage, keyword, args);
+    } else if (eventType === "member_votes") {
+      const memberName = args.name as string | undefined;
+      const mpId = args.mp_id as number | undefined;
+      return await handleMemberVotes(memberName, mpId, days, limit);
     } else {
       throw new Error(
-        `Unknown event_type: ${eventType}. Use 'division', 'rebellion', or 'bill'.`
+        `Unknown event_type: ${eventType}. Use 'division', 'rebellion', 'bill', or 'member_votes'.`
       );
     }
   } catch (error) {
@@ -381,6 +394,120 @@ async function handleBillEvents(
 
   lines.push("");
   lines.push(`Total matching: ${data.totalResults ?? items.length}`);
+
+  return lines.join("\n");
+}
+
+// ─── Member voting history types ──────────────────────────────────────────────
+
+interface MemberSearchItem {
+  value: {
+    id: number;
+    nameDisplayAs: string;
+    latestParty: { name: string };
+    latestHouseMembership: { house: number; membershipFrom: string };
+  };
+}
+
+interface MemberSearchResponse {
+  items: MemberSearchItem[];
+}
+
+interface MemberVoteDivision {
+  DivisionId: number;
+  Date: string;
+  Title: string;
+  AyeCount: number;
+  NoCount: number;
+  Ayes: { MemberId: number }[];
+  Noes: { MemberId: number }[];
+}
+
+async function handleMemberVotes(
+  memberName: string | undefined,
+  mpId: number | undefined,
+  days: number,
+  limit: number
+): Promise<string> {
+  if (!memberName && !mpId) {
+    throw new Error("Provide name or mp_id for event_type='member_votes'.");
+  }
+
+  // Resolve name → ID if needed
+  let memberId = mpId;
+  let displayName = memberName ?? `MP ${mpId}`;
+  let party = "";
+  let constituency = "";
+
+  if (!memberId) {
+    const data = (await parliamentFetch(`${MEMBERS_API}/Members/Search`, {
+      Name: memberName,
+      Take: 1,
+    })) as MemberSearchResponse;
+    const member = data?.items?.[0]?.value;
+    if (!member) {
+      return `No MP found matching "${memberName}".`;
+    }
+    memberId = member.id;
+    displayName = member.nameDisplayAs;
+    party = member.latestParty?.name ?? "";
+    constituency = member.latestHouseMembership?.membershipFrom ?? "";
+  }
+
+  const startDate = daysAgoISO(days);
+  const pageSize = 25;
+  const summaries: MemberVoteDivision[] = [];
+  let skip = 0;
+
+  while (summaries.length < limit) {
+    const take = Math.min(pageSize, limit - summaries.length);
+    const data = (await parliamentFetch(
+      `${COMMONS_VOTES_API}/divisions.json/search`,
+      {
+        "queryParameters.memberId": memberId,
+        "queryParameters.startDate": startDate,
+        "queryParameters.take": take,
+        "queryParameters.skip": skip,
+      }
+    )) as MemberVoteDivision[];
+
+    const items = Array.isArray(data) ? data : [];
+    summaries.push(...items);
+    if (items.length < take) break;
+    skip += take;
+  }
+
+  if (summaries.length === 0) {
+    return `No recorded votes found for ${displayName} in the last ${days} days.`;
+  }
+
+  // The search endpoint returns empty Ayes/Noes arrays — fetch each division
+  // detail to determine how the member actually voted (Aye or No).
+  const details = await batchedFetch(
+    summaries,
+    (div: MemberVoteDivision) =>
+      parliamentFetch(`${COMMONS_VOTES_API}/division/${div.DivisionId}.json`) as Promise<MemberVoteDivision>
+  );
+
+  const lines: string[] = [];
+  lines.push(
+    `Voting record — ${displayName}${party ? ` (${party}` : ""}${constituency ? `, ${constituency}` : ""}${party ? ")" : ""} | Last ${days} days`
+  );
+  lines.push(`Divisions: ${summaries.length}`);
+  lines.push("");
+
+  for (let i = 0; i < summaries.length; i++) {
+    const summary = summaries[i];
+    const detail = details[i];
+    const votedAye = detail?.Ayes?.some((v) => v.MemberId === memberId);
+    const votedNo = detail?.Noes?.some((v) => v.MemberId === memberId);
+    const vote = votedAye ? "AYE" : votedNo ? "NO" : "NOT RECORDED";
+    const passed = summary.AyeCount > summary.NoCount ? "PASSED" : "FAILED";
+    lines.push(`• [${formatDate(summary.Date)}] ${summary.Title}`);
+    lines.push(
+      `  Voted: ${vote} | Result: ${passed} (Ayes: ${summary.AyeCount}, Noes: ${summary.NoCount}) | ID: ${summary.DivisionId}`
+    );
+  }
 
   return lines.join("\n");
 }
