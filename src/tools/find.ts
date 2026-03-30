@@ -591,10 +591,13 @@ async function fetchMemberInterests(
 ): Promise<string> {
   const lower = keyword?.toLowerCase();
 
-  // Fetch ALL interests for this member without category filter
+  // Fetch ALL interests for this member without category filter.
+  // The API hard-caps responses at 20 items regardless of Take — use 20 as pageSize
+  // so items.length < pageSize correctly detects the last page.
   const allInterests: InterestItem[] = [];
   let skip = 0;
-  const pageSize = 50;
+  const pageSize = 20;
+  let totalResults = 0;
 
   while (true) {
     const data = (await parliamentFetch(`${INTERESTS_API}/Interests`, {
@@ -604,19 +607,17 @@ async function fetchMemberInterests(
     })) as InterestsResponse;
 
     const items = data?.items ?? [];
+    totalResults = data?.totalResults ?? totalResults;
     allInterests.push(...items);
 
-    if (items.length < pageSize || skip >= 500) break;
+    if (items.length < pageSize) break;
     skip += pageSize;
   }
 
-  // Only top-level entries (no sub-items)
-  const topLevel = allInterests.filter((i) => i.parentInterestId === null);
-
-  // Optional keyword filter
+  // Apply optional keyword filter across all entries (including child payment records)
   const filtered = lower
-    ? topLevel.filter((i) => i.summary?.toLowerCase().includes(lower))
-    : topLevel;
+    ? allInterests.filter((i) => i.summary?.toLowerCase().includes(lower))
+    : allInterests;
 
   const houseName = member.latestHouseMembership?.house === 1 ? "Commons" : "Lords";
   const constituency = member.latestHouseMembership?.membershipFrom ?? "Unknown";
@@ -626,16 +627,41 @@ async function fetchMemberInterests(
     return `No declared interests found for ${member.nameDisplayAs}${noKeyword}.\n\nMP profile: ${member.nameDisplayAs} (${member.latestParty?.name ?? "Unknown"}, ${houseName}) — ${constituency} | ID: ${member.id}`;
   }
 
+  // Build a map of id → item for parent lookup
+  const itemById = new Map<number, InterestItem>(allInterests.map((i) => [i.id, i]));
+
+  // Separate top-level and child entries within the filtered set
+  const topLevel = filtered.filter((i) => i.parentInterestId === null);
+  const children = filtered.filter((i) => i.parentInterestId !== null);
+
+  // Group children by parentId for display
+  const childrenByParent = new Map<number, InterestItem[]>();
+  for (const child of children) {
+    const pid = child.parentInterestId!;
+    if (!childrenByParent.has(pid)) childrenByParent.set(pid, []);
+    childrenByParent.get(pid)!.push(child);
+  }
+
+  // If keyword filter is active and a child matched, ensure its parent is shown even if
+  // it didn't match — so children appear with context
+  const parentIdsNeeded = new Set(children.map((c) => c.parentInterestId!));
+  const extraParents = lower
+    ? allInterests.filter(
+        (i) => i.parentInterestId === null && parentIdsNeeded.has(i.id) && !topLevel.includes(i)
+      )
+    : [];
+  const allTopLevel = [...topLevel, ...extraParents];
+
   const lines: string[] = [];
   lines.push(
     `Declared interests for ${member.nameDisplayAs} (${member.latestParty?.name ?? "Unknown"}, ${houseName} — ${constituency}):${keyword ? ` filtered by "${keyword}"` : ""}`
   );
-  lines.push(`Total: ${filtered.length} entries`);
+  lines.push(`Total API records: ${totalResults} | Showing: ${filtered.length + extraParents.length}`);
   lines.push("");
 
-  // Group by category
+  // Group top-level by category
   const byCategory = new Map<string, InterestItem[]>();
-  for (const item of filtered.slice(0, limit)) {
+  for (const item of allTopLevel) {
     const cat = item.categoryName ?? "Uncategorised";
     if (!byCategory.has(cat)) byCategory.set(cat, []);
     byCategory.get(cat)!.push(item);
@@ -645,12 +671,13 @@ async function fetchMemberInterests(
     lines.push(`${cat}:`);
     for (const item of items) {
       lines.push(`  • ${item.summary}`);
+      // Show child entries (e.g. individual payments) indented under their parent
+      const kids = childrenByParent.get(item.id) ?? [];
+      for (const child of kids) {
+        lines.push(`    – ${child.summary}`);
+      }
     }
     lines.push("");
-  }
-
-  if (filtered.length > limit) {
-    lines.push(`(Showing first ${limit} of ${filtered.length} entries)`);
   }
 
   return lines.join("\n").trimEnd();
