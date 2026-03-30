@@ -23,6 +23,9 @@
   "engines": {
     "node": ">=18"
   },
+  "files": [
+    "dist/"
+  ],
   "license": "MIT",
   "keywords": [
     "mcp",
