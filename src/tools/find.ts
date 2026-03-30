@@ -11,7 +11,11 @@ export const findTools = [
   {
     name: "find_entities",
     description:
-      "Find MPs, bills, petitions, or declared financial interests. entity_type='mp' searches members by name, party, constituency, house, or status. entity_type='bill' searches legislation by title keyword, stage, or house. entity_type='petition' finds petitions by keyword. entity_type='interest' finds MPs with declared financial interests matching a keyword (e.g. 'defence', 'BAE Systems', 'fossil fuel', 'property').",
+      "Find MPs, bills, petitions, or declared financial interests. " +
+      "entity_type='mp': search members by name/party/constituency/house/status. " +
+      "entity_type='bill': search legislation by title keyword/stage/house. " +
+      "entity_type='petition': find petitions by keyword. " +
+      "entity_type='interest': fetch an MP's declared financial interests. Pass name='John McDonnell' OR mp_id=178 (member ID from a prior MP lookup). Optionally add keyword to filter by topic (e.g. keyword='property'). To find ALL MPs with a given interest topic, omit name/mp_id and pass only keyword='defence'.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22,7 +26,11 @@ export const findTools = [
         },
         name: {
           type: "string",
-          description: "Search MP or Lord by name.",
+          description: "MP or Lord name. For entity_type='mp': filter by name. For entity_type='interest': fetch this specific MP's declared interests.",
+        },
+        mp_id: {
+          type: "number",
+          description: "MP member ID (integer). For entity_type='interest': fetch declared interests for the MP with this ID. Use this when you already have the member ID from a prior find_entities mp lookup.",
         },
         party: {
           type: "string",
@@ -49,7 +57,7 @@ export const findTools = [
         keyword: {
           type: "string",
           description:
-            "Bill title search, petition text search, or financial interest keyword.",
+            "Bill title search, petition text search, or financial interest topic filter.",
         },
         petition_state: {
           type: "string",
@@ -437,15 +445,33 @@ async function findInterests(
   limit: number
 ): Promise<string> {
   const keyword = args.keyword as string | undefined;
+  const name = args.name as string | undefined;
+  const mpId = args.mp_id as number | undefined;
+
+  // Direct ID lookup — skip member resolution entirely
+  if (mpId) {
+    const memberData = (await parliamentFetch(`${MEMBERS_API}/Members/${mpId}`)) as { value: MemberValue };
+    const member = memberData?.value;
+    if (!member) {
+      return `No MP found with ID ${mpId}.`;
+    }
+    return await fetchMemberInterests(member, keyword, limit);
+  }
+
+  // Name-based lookup
+  if (name) {
+    return await findInterestsByMember(name, keyword, limit);
+  }
 
   if (!keyword) {
     throw new Error(
-      "A 'keyword' is required when searching financial interests (e.g. 'defence', 'property', 'fossil fuel')."
+      "Provide name='MP name', mp_id=<member ID>, or keyword='topic' to search financial interests."
     );
   }
 
   const lower = keyword.toLowerCase();
-  const categoryIds = [12, 8, 9];
+  // All 12 interest categories
+  const categoryIds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
   // Fetch all pages for each category concurrently, then merge
   async function fetchCategoryInterests(categoryId: number): Promise<InterestItem[]> {
@@ -526,4 +552,106 @@ async function findInterests(
   }
 
   return lines.join("\n");
+}
+
+async function findInterestsByMember(
+  name: string,
+  keyword: string | undefined,
+  limit: number
+): Promise<string> {
+  // Step 1: resolve MP name → member ID
+  const memberData = (await parliamentFetch(`${MEMBERS_API}/Members/Search`, {
+    Name: name,
+    Take: 1,
+    IsCurrentMember: true,
+  })) as MemberSearchResponse;
+
+  const member = memberData?.items?.[0]?.value;
+
+  if (!member) {
+    // Retry without IsCurrentMember in case they're a former MP
+    const retryData = (await parliamentFetch(`${MEMBERS_API}/Members/Search`, {
+      Name: name,
+      Take: 1,
+    })) as MemberSearchResponse;
+    const retryMember = retryData?.items?.[0]?.value;
+    if (!retryMember) {
+      return `No MP or Lord found matching "${name}".`;
+    }
+    return await fetchMemberInterests(retryMember, keyword, limit);
+  }
+
+  return await fetchMemberInterests(member, keyword, limit);
+}
+
+async function fetchMemberInterests(
+  member: MemberValue,
+  keyword: string | undefined,
+  limit: number
+): Promise<string> {
+  const lower = keyword?.toLowerCase();
+
+  // Fetch ALL interests for this member without category filter
+  const allInterests: InterestItem[] = [];
+  let skip = 0;
+  const pageSize = 50;
+
+  while (true) {
+    const data = (await parliamentFetch(`${INTERESTS_API}/Interests`, {
+      MemberId: member.id,
+      Take: pageSize,
+      Skip: skip,
+    })) as InterestsResponse;
+
+    const items = data?.items ?? [];
+    allInterests.push(...items);
+
+    if (items.length < pageSize || skip >= 500) break;
+    skip += pageSize;
+  }
+
+  // Only top-level entries (no sub-items)
+  const topLevel = allInterests.filter((i) => i.parentInterestId === null);
+
+  // Optional keyword filter
+  const filtered = lower
+    ? topLevel.filter((i) => i.summary?.toLowerCase().includes(lower))
+    : topLevel;
+
+  const houseName = member.latestHouseMembership?.house === 1 ? "Commons" : "Lords";
+  const constituency = member.latestHouseMembership?.membershipFrom ?? "Unknown";
+
+  if (filtered.length === 0) {
+    const noKeyword = keyword ? ` matching "${keyword}"` : "";
+    return `No declared interests found for ${member.nameDisplayAs}${noKeyword}.\n\nMP profile: ${member.nameDisplayAs} (${member.latestParty?.name ?? "Unknown"}, ${houseName}) — ${constituency} | ID: ${member.id}`;
+  }
+
+  const lines: string[] = [];
+  lines.push(
+    `Declared interests for ${member.nameDisplayAs} (${member.latestParty?.name ?? "Unknown"}, ${houseName} — ${constituency}):${keyword ? ` filtered by "${keyword}"` : ""}`
+  );
+  lines.push(`Total: ${filtered.length} entries`);
+  lines.push("");
+
+  // Group by category
+  const byCategory = new Map<string, InterestItem[]>();
+  for (const item of filtered.slice(0, limit)) {
+    const cat = item.categoryName ?? "Uncategorised";
+    if (!byCategory.has(cat)) byCategory.set(cat, []);
+    byCategory.get(cat)!.push(item);
+  }
+
+  for (const [cat, items] of byCategory) {
+    lines.push(`${cat}:`);
+    for (const item of items) {
+      lines.push(`  • ${item.summary}`);
+    }
+    lines.push("");
+  }
+
+  if (filtered.length > limit) {
+    lines.push(`(Showing first ${limit} of ${filtered.length} entries)`);
+  }
+
+  return lines.join("\n").trimEnd();
 }

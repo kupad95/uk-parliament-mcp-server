@@ -201,7 +201,8 @@ export async function handleQueryTool(
     // ── Step 3: Interest filter ───────────────────────────────────────────────
     if (hasInterest) {
       const interestLower = hasInterest.toLowerCase();
-      const categoryIds = [12, 8, 9];
+      // All 12 interest categories
+      const categoryIds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
       // Map of memberId → interest summaries
       const interestMap = new Map<number, { name: string; party: string; constituency: string; interests: string[] }>();
