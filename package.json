@@ -1,0 +1,35 @@
+{
+  "name": "uk-parliament-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for UK Parliament data — bills, votes, MPs, interests, debates, petitions",
+  "type": "module",
+  "bin": {
+    "uk-parliament-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.37",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "parliament",
+    "uk",
+    "bills",
+    "votes",
+    "hansard"
+  ]
+}
