@@ -3,6 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub](https://img.shields.io/badge/GitHub-kupad95-blue)](https://github.com/kupad95/uk-parliament-mcp-server)
 
+https://github.com/user-attachments/assets/eec2a7bc-1ddf-4b25-8553-8d5b33a57ff6
+
 A **Model Context Protocol (MCP) server** for live UK Parliament data.
 Query bills, votes, MP profiles, financial interests, and petitions straight from your MCP‑compatible assistant, no API key required.
 
